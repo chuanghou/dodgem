@@ -1,0 +1,242 @@
+package com.stellariver.dodgem;
+
+//import com.alibaba.china.bigwave.common.exception.BizException;
+//import com.sun.tools.javac.api.JavacTool;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.joor.Reflect;
+import org.joor.ReflectException;
+
+import javax.tools.*;
+import javax.tools.JavaCompiler.CompilationTask;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.OutputStream;
+import java.io.StringWriter;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodHandles.Lookup;
+import java.lang.reflect.InvocationTargetException;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.stream.Collectors;
+
+/**
+ * 复制自org.joor.Compile三方库的代码, 修复内存泄露的问题
+ *
+ * @author by prince.wz on 2021/1/27.
+ */
+@Slf4j
+public class JavaClassParser {
+
+    public static Class<?> compile(String className, String content) {
+        // 移除package信息
+        content = Arrays.stream(content.split("\n")).map(x -> x.startsWith("package") ? " " : x).collect(Collectors.joining("\n"));
+
+        String compileOut = null;
+        // 采用默认的classloader
+        Lookup lookup = MethodHandles.lookup();
+        ClassLoader parentCl = lookup.lookupClass().getClassLoader();
+
+        // 修改当前线程cl
+        Thread.currentThread().setContextClassLoader(parentCl);
+
+        try (URLClassLoader cl = new URLClassLoader(new URL[0], parentCl)) {
+            JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+
+            List<CharSequenceJavaFileObject> files = new ArrayList<>();
+            files.add(new CharSequenceJavaFileObject(className, content));
+            StringWriter out = new StringWriter();
+
+            List<String> options = new ArrayList<>();
+            // 不使用SharedNameTable （jdk1.7自带的软引用，会影响GC的回收，jdk1.9已经解决）
+            options.add("-XDuseUnsharedTable");
+
+            // jdk1.8的bug, 需要手动指定编译参数
+            // https://bugs.java.com/bugdatabase/view_bug.do?bug_id=8039262
+            System.setProperty("DuseJavaUtilZip", "true");
+            options.add("-XDuseJavaUtilZip");
+
+            //设置classpath
+            StringBuilder classpath = new StringBuilder();
+            String separator = System.getProperty("path.separator");
+            String prop = System.getProperty("java.class.path");
+
+            if (prop != null && !"".equals(prop)) {
+                classpath.append(prop);
+            }
+
+            for (URL url : cl.getURLs()) {
+                if (classpath.length() > 0) {
+                    classpath.append(separator);
+                }
+
+                if ("file".equals(url.getProtocol())) {
+                    classpath.append(new File(url.toURI()));
+                }
+            }
+            if (parentCl instanceof URLClassLoader) {
+                for (URL url : ((URLClassLoader) parentCl).getURLs()) {
+                    if (classpath.length() > 0) {
+                        classpath.append(separator);
+                    }
+                    classpath.append(url.getFile());
+                }
+            }
+            options.addAll(Arrays.asList("-classpath", classpath.toString()));
+
+            ClassFileManager fileManager = new ClassFileManager(compiler.getStandardFileManager(null, null, null));
+
+            CompilationTask task = compiler.getTask(out, fileManager, null, options, null, files);
+
+            task.call();
+
+            compileOut = out.toString();
+
+            if (fileManager.isEmpty()) {
+                throw new ReflectException("Compilation error: " + out);
+            }
+
+            Class<?> result = null;
+
+
+            result = fileManager.loadAndReturnMainClass(className,
+                    (name, bytes) -> Reflect.on(cl).call("defineClass", name, bytes, 0, bytes.length).get());
+
+            // 编译失败
+            if (result == null) {
+                throw new RuntimeException("编译失败");
+            }
+
+            return result;
+
+        } catch (Throwable e) {
+            Throwable throwable = e;
+            if (throwable.getCause() instanceof InvocationTargetException) {
+                throwable = ((InvocationTargetException) throwable.getCause()).getTargetException();
+            }
+
+            String errMsg;
+
+            if (throwable instanceof RuntimeException) {
+                // 业务报错, 直接展示报错原因
+                errMsg = throwable.getMessage();
+            } else if (throwable instanceof ClassFormatError) {
+                // 有注解的类, 编译报错
+                errMsg = compileOut;
+            } else {
+                // 其他异常报错, 需要具体的定位信息
+                errMsg = "parseScript exception! scriptText:" + ExceptionUtils.getStackTrace(throwable);
+            }
+            log.error(errMsg);
+        }
+        return null;
+    }
+
+    static final class JavaFileObject extends SimpleJavaFileObject {
+        final ByteArrayOutputStream os = new ByteArrayOutputStream();
+
+        JavaFileObject(String name, JavaFileObject.Kind kind) {
+            super(URI.create("string:///" + name.replace('.', '/') + kind.extension), kind);
+        }
+
+        byte[] getBytes() {
+            return os.toByteArray();
+        }
+
+        @Override
+        public OutputStream openOutputStream() {
+            return os;
+        }
+
+        @Override
+        public CharSequence getCharContent(boolean ignoreEncodingErrors) {
+            return new String(os.toByteArray(), StandardCharsets.UTF_8);
+        }
+
+    }
+
+    static final class ClassFileManager extends ForwardingJavaFileManager<StandardJavaFileManager> {
+        private final Map<String, JavaFileObject> fileObjectMap;
+        private Map<String, byte[]> classes;
+
+        ClassFileManager(StandardJavaFileManager standardManager) {
+            super(standardManager);
+
+            fileObjectMap = new HashMap<>();
+        }
+
+        /***
+         * 需要重写父类的isSameFile, 不然编译的时候会报错
+         */
+        @Override
+        public boolean isSameFile(FileObject a, FileObject b) {
+            return a.getName().equals(b.getName());
+        }
+
+        @Override
+        public JavaFileObject getJavaFileForOutput(
+                JavaFileManager.Location location,
+                String className,
+                JavaFileObject.Kind kind,
+                FileObject sibling
+        ) {
+            JavaFileObject result = new JavaFileObject(className, kind);
+            fileObjectMap.put(className, result);
+            return result;
+        }
+
+        boolean isEmpty() {
+            return fileObjectMap.isEmpty();
+        }
+
+        Map<String, byte[]> classes() {
+            if (classes == null) {
+                classes = new HashMap<>();
+
+                for (Entry<String, JavaFileObject> entry : fileObjectMap.entrySet()) {
+                    classes.put(entry.getKey(), entry.getValue().getBytes());
+                }
+            }
+
+            return classes;
+        }
+
+        Class<?> loadAndReturnMainClass(String mainClassName, ThrowingBiFunction<String, byte[], Class<?>> definer)
+                throws Exception {
+            Class<?> result = null;
+
+            for (Entry<String, byte[]> entry : classes().entrySet()) {
+                Class<?> c = definer.apply(entry.getKey(), entry.getValue());
+                if (mainClassName.equals(entry.getKey())) {
+                    result = c;
+                }
+            }
+
+            return result;
+        }
+    }
+
+    @FunctionalInterface
+    interface ThrowingBiFunction<T, U, R> {
+        R apply(T t, U u) throws Exception;
+    }
+
+    static final class CharSequenceJavaFileObject extends SimpleJavaFileObject {
+        final CharSequence content;
+
+        public CharSequenceJavaFileObject(String className, CharSequence content) {
+            super(URI.create("string:///" + className.replace('.', '/') + JavaFileObject.Kind.SOURCE.extension),
+                    JavaFileObject.Kind.SOURCE);
+            this.content = content;
+        }
+
+        @Override
+        public CharSequence getCharContent(boolean ignoreEncodingErrors) {
+            return content;
+        }
+    }
+}
